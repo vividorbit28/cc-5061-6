@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Blur Inversion Studio — motion analysis & regularised multi-frame inversion</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">BI</div>
+    <div>
+      <h1>Blur Inversion Studio</h1>
+      <p class="sub">Multi-frame exposure-blur inversion · motion &amp; shutter assumptions · regularised CG solve</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="engineState" class="pill idle">idle</span>
+    <button id="btnBuild" class="ghost" title="Render deliverable MP4s and the metric report locally">Build deliverable videos</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- LEFT: clip browser + frame player -->
+  <section class="panel left">
+    <div class="panel-head">
+      <h2>1 · Blurred clips</h2>
+      <span class="hint">Synthetic, shared forward model</span>
+    </div>
+    <div id="clipList" class="clip-list"></div>
+
+    <div class="panel-head sub-head">
+      <h2>2 · Motion analysis player</h2>
+      <span class="hint">inspect frames before inversion</span>
+    </div>
+    <div class="player">
+      <div class="viewer">
+        <img id="playerFrame" alt="selected observation frame" />
+        <div class="viewer-badges">
+          <span id="frameIndexBadge" class="badge">frame –</span>
+          <span class="badge muted">blurred observation</span>
+        </div>
+      </div>
+      <div class="transport">
+        <button id="playToggle" class="ghost" aria-label="play/pause">▶ play</button>
+        <input id="frameSlider" type="range" min="0" max="6" step="1" value="3" aria-label="frame index" />
+        <label class="toggle small"><input type="checkbox" id="showClean" /> show clean reference</label>
+      </div>
+      <div class="player-meta">
+        <div class="meta-grid">
+          <div><span class="k">clip</span><span id="metaClip">–</span></div>
+          <div><span class="k">shutter ρ</span><span id="metaRho">–</span></div>
+          <div><span class="k">exposure κ(t)</span><span id="metaExposure">–</span></div>
+          <div><span class="k">noise σ</span><span id="metaNoise">–</span></div>
+        </div>
+      </div>
+
+      <div class="reg-block">
+        <div class="row between">
+          <h3>Blind registration (phase correlation)</h3>
+          <span class="hint">blur biases this toward zero</span>
+        </div>
+        <canvas id="regPlot" width="520" height="150" aria-label="per-frame displacement"></canvas>
+        <div class="reg-readout">
+          <span>candidate path <b id="regCandidate">–</b></span>
+          <span>window spread <b id="regSpread">–</b></span>
+        </div>
+        <p class="note">The registered velocity is a starting point only. It is compared against your stated assumption by the forward residual after inversion.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- CENTER: assumptions + inversion -->
+  <section class="panel center">
+    <div class="panel-head">
+      <h2>3 · Motion &amp; shutter assumption</h2>
+      <span class="hint">explicit, not learned</span>
+    </div>
+    <form id="assumptionForm" class="assumption">
+      <div class="field-row">
+        <label class="field">
+          <span>global motion</span>
+          <select id="kind">
+            <option value="linear">constant velocity (linear)</option>
+            <option value="shake">pan + sinusoidal shake</option>
+            <option value="arc">shutter arc (rotation)</option>
+            <option value="stationary">stationary</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>shutter fraction ρ</span>
+          <input id="rho" type="range" min="0.05" max="0.99" step="0.01" value="0.8" />
+          <output id="rhoOut">0.80</output>
+        </label>
+      </div>
+
+      <div class="field-row" id="linearFields">
+        <label class="field">
+          <span>velocity x <em>px/frame</em></span>
+          <input id="vx" type="range" min="-16" max="16" step="0.1" value="7" />
+          <output id="vxOut">7.0</output>
+        </label>
+        <label class="field">
+          <span>velocity y <em>px/frame</em></span>
+          <input id="vy" type="range" min="-16" max="16" step="0.1" value="1.2" />
+          <output id="vyOut">1.2</output>
+        </label>
+      </div>
+
+      <div class="field-row hidden" id="shakeFields">
+        <label class="field">
+          <span>shake amplitude <em>px</em></span>
+          <input id="amp" type="range" min="0" max="6" step="0.1" value="2.2" />
+          <output id="ampOut">2.2</output>
+        </label>
+        <label class="field">
+          <span>shake frequency <em>1/frame</em></span>
+          <input id="freq" type="range" min="0.1" max="2" step="0.05" value="0.9" />
+          <output id="freqOut">0.90</output>
+        </label>
+      </div>
+
+      <div class="field-row hidden" id="arcFields">
+        <label class="field">
+          <span>angular rate <em>rad/frame</em></span>
+          <input id="omega" type="range" min="0.005" max="0.08" step="0.001" value="0.03" />
+          <output id="omegaOut">0.030</output>
+        </label>
+        <label class="field">
+          <span>pivot x/y <em>scene px</em></span>
+          <span class="pair">
+            <input id="pivotX" type="number" step="10" value="-120" />
+            <input id="pivotY" type="number" step="10" value="-60" />
+          </span>
+        </label>
+      </div>
+
+      <label class="field wide">
+        <span>exposure weighting κ(t) during the shutter</span>
+        <select id="exposureKind">
+          <option value="uniform">uniform (rectangular)</option>
+          <option value="centered">centred (fast open/close)</option>
+          <option value="ramp">ramp (progressive)</option>
+        </select>
+      </label>
+
+      <div class="field-row">
+        <label class="field">
+          <span>reference frame</span>
+          <select id="refIndex"></select>
+        </label>
+        <label class="field">
+          <span>regularisation λ <output id="lambdaOut">auto</output></span>
+          <select id="lambdaMode">
+            <option value="auto">auto (from noise estimate)</option>
+            <option value="manual">manual</option>
+          </select>
+          <input id="lambda" type="range" min="0.001" max="0.3" step="0.001" value="0.02" disabled />
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label class="field">
+          <span>TV weight</span>
+          <input id="tv" type="range" min="0" max="0.05" step="0.001" value="0" />
+          <output id="tvOut">0.000</output>
+        </label>
+        <label class="field">
+          <span>max CG iterations</span>
+          <input id="maxIter" type="range" min="10" max="120" step="5" value="50" />
+          <output id="maxIterOut">50</output>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="btnInvert" class="primary" type="submit">Invert blur →</button>
+        <button id="btnFromReg" class="ghost" type="button" title="Copy the blind registration into the assumption sliders">Use registered velocity</button>
+        <label class="toggle small"><input type="checkbox" id="compare" checked /> compare hypotheses</label>
+      </div>
+      <div id="jobStatus" class="job-status idle">
+        <div class="bar"><span id="jobBar"></span></div>
+        <div class="job-text"><span id="jobStage">ready</span><span id="jobDetail"></span></div>
+      </div>
+    </form>
+  </section>
+
+  <!-- RIGHT: results -->
+  <section class="panel right">
+    <div class="panel-head">
+      <h2>4 · Inversion result</h2>
+      <span class="hint" id="resultHint">run an inversion to populate</span>
+    </div>
+
+    <div id="emptyResult" class="empty-result">
+      <div class="empty-glyph">⇆</div>
+      <p>Choose a clip, inspect its frames, set the motion/shutter assumption, then <b>Invert blur</b>.</p>
+      <p class="note">The solver minimises a masked multi-frame data term plus a high-pass prior with conjugate gradients. It does not receive the clean frames.</p>
+    </div>
+
+    <div id="resultWrap" class="result-wrap hidden">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="compare" role="tab">estimate</button>
+        <button class="tab" data-tab="residual" role="tab">data residual</button>
+        <button class="tab" data-tab="support" role="tab">data support</button>
+        <button class="tab" data-tab="kernel" role="tab">exposure kernel</button>
+        <button class="tab" data-tab="hyp" role="tab">hypotheses</button>
+        <button class="tab" data-tab="eval" role="tab">evaluation*</button>
+      </div>
+
+      <div class="tab-body">
+        <div class="tab-pane active" data-pane="compare">
+          <div class="compare-grid">
+            <figure><img id="imgObs" alt="blurred input" /><figcaption>blurred input (ref frame)</figcaption></figure>
+            <figure><img id="imgEst" alt="inverted estimate" /><figcaption>inverted estimate</figcaption></figure>
+          </div>
+          <div class="slider-compare">
+            <label class="toggle small"><input type="checkbox" id="blink" /> blink against input</label>
+            <span class="hint">same display gain for both (default 1.0)</span>
+          </div>
+          <div class="row gains">
+            <label class="field inline">display gain <input id="dispGain" type="range" min="0.5" max="2.5" step="0.05" value="1" /><output id="dispGainOut">1.00</output></label>
+            <span class="warn small">Display gain is cosmetic and never feeds the solver or the metrics.</span>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-pane="residual">
+          <div class="compare-grid two">
+            <figure><img id="imgPred" alt="re-blurred estimate" /><figcaption>model prediction: re-blurred estimate</figcaption></figure>
+            <figure><img id="imgRes" alt="residual heatmap" /><figcaption id="capRes">|input − prediction| · mean over frames · colour spans 0..4σ</figcaption></figure>
+          </div>
+          <div class="metrics-strip" id="residualMetrics" role="list"></div>
+          <p class="note" id="residualNote"></p>
+        </div>
+
+        <div class="tab-pane" data-pane="support">
+          <div class="compare-grid two">
+            <figure><img id="imgSupport" alt="data support map" /><figcaption>data support 1.0 = measured, 0.0 = prior fill</figcaption></figure>
+            <figure><img id="imgSupportOverlay" alt="support overlay" /><figcaption>support over estimate</figcaption></figure>
+          </div>
+          <p class="note">Support is the local share of high-frequency energy that the assumed exposure kernels still pass, weighted by the same λ the solver used. Values near 1 mean those spatial frequencies are constrained by the observations; low values mean the estimate is free there and the prior is deciding. The grey panel is contrast-stretched for legibility (not an absolute scale); the amber overlay marks low-support areas on the estimate. Fine texture can look sharp and still be prior fill.</p>
+        </div>
+
+        <div class="tab-pane" data-pane="kernel">
+          <div class="kernel-wrap">
+            <canvas id="kernelCanvas" width="220" height="220" aria-label="exposure kernel"></canvas>
+            <div class="kernel-meta" id="kernelMeta"></div>
+          </div>
+          <p class="note">Path-integrated exposure kernel from your assumption (before any image). The 1-D inset is the profile along the dominant direction.</p>
+        </div>
+
+        <div class="tab-pane" data-pane="hyp">
+          <div id="hypBody"></div>
+        </div>
+
+        <div class="tab-pane" data-pane="eval">
+          <div class="eval-warning">* Ground truth is synthetic. These numbers are for scoring only; the solver never reads them.</div>
+          <div id="evalBody"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span id="sbEngine">engine: –</span>
+  <span id="sbJob">job: –</span>
+  <span id="sbTime">–</span>
+  <span id="sbLambda">λ: –</span>
+  <span class="spacer"></span>
+  <span class="note-inline">Noise floor is estimated from the observations; λ auto follows it.</span>
+</footer>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>
