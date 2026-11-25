@@ -4,8 +4,14 @@
 import { GEOM, makeClip, forwardFromLatent } from '../src/synth.js';
 import { invert, residualStats, compareHypotheses, analyzeClip } from '../src/pipeline.js';
 import { evaluate, estimateNoise, autoLambda } from '../src/evaluate.js';
-import { psnr, ssim, rms } from '../src/util.js';
+import { psnr, ssim } from '../src/util.js';
 import { phaseCorrelate } from '../src/motion.js';
+import {
+  makeLayeredClip, invertLayered,
+  invertSingleLayer, layeredResidualRmse, compareLayeredStrategies,
+  estimateForegroundRegion, MAX_LAYERS,
+} from '../src/layers.js';
+import { embedObservation } from '../src/model.js';
 
 let passed = 0;
 let failed = 0;
@@ -247,6 +253,149 @@ test('estimate is bounded and finite (no NaN/Inf escape)', () => {
     }
     less(mn, 0.2, 'lower bound');
     greater(mx, 0.6, 'upper bound');
+  }
+});
+
+// ---------------------------------------------------------------------------
+console.log('layered motion inversion');
+// ---------------------------------------------------------------------------
+
+const embed = (m) => embedObservation(m, obsW, obsH, GEOM.padW, GEOM.padH, GEOM.ox, GEOM.oy);
+const oracleSpec = (clip, overrides = {}) => ({
+  layers: [
+    { kind: 'linear', vx: clip.truthVelocities.bg.vx, vy: clip.truthVelocities.bg.vy, maskCanvas: embed(clip.truthMasks.bg), fixedCoverage: true },
+    { kind: 'linear', vx: clip.truthVelocities.fg.vx, vy: clip.truthVelocities.fg.vy, maskCanvas: embed(clip.truthMasks.fg) },
+  ],
+  refIndex: clip.refIndex, rho: clip.spec.rho, lambda: 0.004, maxIter: 80, tol: 1e-9,
+  alternations: 0, estimateMasks: false, ...overrides,
+});
+const isIterable = (v) => Array.isArray(v) || ArrayBuffer.isView(v);
+const flatten = (v) => (isIterable(v) ? Array.from(v).flatMap(flatten) : [v]);
+const allFinite = (arrays) => flatten(arrays).every(Number.isFinite);
+
+test('generator coverage is a complementary alpha partition (bg + fg = 1)', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, boundaryMode: 'frozen', noiseSigma: 0, quantize: false });
+  for (let i = 0; i < obsW * obsH; i++) approx(clip.truthMasks.bg[i] + clip.truthMasks.fg[i], 1, 1e-9, 'coverage partition');
+});
+
+test('frozen-boundary oracle closes the forward loop (re-blur RMSE ~ 0)', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0, quantize: false, boundaryMode: 'frozen' });
+  const r = invertLayered(clip.obs, oracleSpec(clip));
+  less(layeredResidualRmse(r, clip.obs), 2e-3, 'frozen closed-loop RMSE');
+  greater(psnr(r.estimate, clip.clean[clip.refIndex]), 30, 'oracle composite PSNR');
+});
+
+test('exact time-sampled boundaries: frozen approximation error concentrates at layer edges', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0, quantize: false, boundaryMode: 'exact' });
+  const r = invertLayered(clip.obs, oracleSpec(clip, { maxIter: 40 }));
+  const fg = clip.truthMasks.fg;
+  let seB = 0, nB = 0, seI = 0, nI = 0;
+  for (let k = 0; k < clip.obs.length; k++) {
+    for (let y = 2; y < obsH - 2; y++) for (let x = 2; x < obsW - 2; x++) {
+      const i = y * obsW + x;
+      const d = r.reblur[k].residual[i];
+      if (fg[i] > 0.02 && fg[i] < 0.98) { seB += d * d; nB++; }
+      else { seI += d * d; nI++; }
+    }
+  }
+  const rb = Math.sqrt(seB / nB), ri = Math.sqrt(seI / nI);
+  greater(nB, 0, 'boundary pixels exist');
+  greater(rb / ri, 1.25, `boundary/interior residual ratio ${(rb / ri).toFixed(2)}`);
+});
+
+test('different-speed fg/bg: layered model beats the single-motion model on residual and PSNR', () => {
+  // Frozen-boundary clip shares the inversion's declared approximation, so the
+  // comparison isolates the benefit of a second motion layer (the exact clip's
+  // boundary-approximation error is tested separately above).
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0.002, quantize: true, boundaryMode: 'frozen' });
+  const layered = invertLayered(clip.obs, oracleSpec(clip, { maxIter: 45 }));
+  const single = invertSingleLayer(clip.obs, { vx: clip.truthVelocities.bg.vx, vy: clip.truthVelocities.bg.vy, refIndex: clip.refIndex, rho: clip.spec.rho, lambda: 0.004, maxIter: 45 });
+  const rL = layeredResidualRmse(layered, clip.obs);
+  const rS = layeredResidualRmse(single, clip.obs);
+  less(rL, rS, `layered RMSE ${rL.toFixed(4)} vs single ${rS.toFixed(4)}`);
+  greater(rS / rL, 4, `forward-residual reduction factor ${(rS / rL).toFixed(1)}x`);
+  greater(psnr(layered.estimate, clip.clean[clip.refIndex]) - psnr(single.estimate, clip.clean[clip.refIndex]), 4, 'layered PSNR gain');
+});
+
+test('moving foreground over a static background is recovered with closed-loop residual', () => {
+  const clip = makeLayeredClip({
+    seed: 31, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0.002, quantize: true, boundaryMode: 'frozen',
+    bgMotion: { type: 'pan', params: { vx: 0, vy: 0 } }, fgMotion: { vx: -4.5, vy: 1.2 },
+  });
+  const r = invertLayered(clip.obs, oracleSpec(clip, { maxIter: 60 }));
+  less(layeredResidualRmse(r, clip.obs), 8e-3, 'static-bg closed-loop RMSE');
+  approx(r.kernels.length, 2, 0, 'one independent kernel per layer');
+});
+
+test('layer count is capped at MAX_LAYERS so noise cannot be fit by adding kernels', () => {
+  const dummy = () => ({ kind: 'linear', vx: 0, vy: 0, maskCanvas: new Float64Array(GEOM.padW * GEOM.padH) });
+  let threw = false;
+  try {
+    invertLayered([new Float64Array(obsW * obsH)], { layers: Array.from({ length: MAX_LAYERS + 1 }, dummy), estimateMasks: false, maxIter: 1 });
+  } catch (e) { threw = /at most/.test(e.message); }
+  if (!threw) throw new Error('expected layer-cap error');
+});
+
+test('an unidentifiable (zero-coverage) layer is flagged by its uncertainty map, not invented detail', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 3, refIndex: 1, rho: 0.8, noiseSigma: 0.002, quantize: true, boundaryMode: 'frozen' });
+  const zero = new Float64Array(GEOM.padW * GEOM.padH);
+  const r = invertLayered(clip.obs, {
+    layers: [
+      { kind: 'linear', vx: clip.truthVelocities.bg.vx, vy: clip.truthVelocities.bg.vy, maskCanvas: embed(clip.truthMasks.bg), fixedCoverage: true },
+      { kind: 'linear', vx: 3, vy: 1, maskCanvas: zero },
+    ],
+    refIndex: 1, rho: 0.8, lambda: 0.01, maxIter: 20, alternations: 0, estimateMasks: false,
+  });
+  approx(r.uncertainty.length, 2, 0, 'uncertainty map per layer');
+  const meanU = r.uncertainty[1].reduce((a, b) => a + b, 0) / r.uncertainty[1].length;
+  greater(meanU, 0.9, `zero-coverage layer uncertainty mean ${meanU.toFixed(2)}`);
+  const meanX = r.layerEstimates[1].reduce((a, b) => a + Math.abs(b), 0) / r.layerEstimates[1].length;
+  less(meanX, 0.05, 'unidentifiable layer carries no invented structure');
+});
+
+test('global single-motion inversion runs as the one-layer special config', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0.002, quantize: true, boundaryMode: 'frozen' });
+  const r = invertSingleLayer(clip.obs, { vx: clip.truthVelocities.bg.vx, vy: clip.truthVelocities.bg.vy, refIndex: clip.refIndex, rho: clip.spec.rho, lambda: 0.01, maxIter: 30 });
+  approx(r.layers.length, 1, 0, 'single layer');
+  let cover = 0;
+  for (const v of r.layerMasks[0]) cover += v;
+  approx(cover / r.layerMasks[0].length, 1, 1e-9, 'full-window coverage');
+  less(layeredResidualRmse(r, clip.obs), 0.1, 'single-layer forward residual finite and small-ish');
+});
+
+test('data-driven lock region is derived from observations (no hand mask) and detects the moving object', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0.002, quantize: true, boundaryMode: 'frozen' });
+  const fg = estimateForegroundRegion(clip.obs, { x: clip.truthVelocities.bg.vx, y: clip.truthVelocities.bg.vy }, 2, obsW, obsH);
+  let mx = 0; for (const v of fg) mx = Math.max(mx, v);
+  greater(mx, 0.5, 'foreground lock strength');
+  const r = invertLayered(clip.obs, {
+    layers: [
+      { kind: 'linear', vx: clip.truthVelocities.bg.vx, vy: clip.truthVelocities.bg.vy },
+      { kind: 'linear', vx: clip.truthVelocities.fg.vx, vy: clip.truthVelocities.fg.vy },
+    ],
+    refIndex: 2, rho: 0.8, lambda: 0.01, maxIter: 25, alternations: 0, estimateMasks: true,
+    bgVelocity: { x: clip.truthVelocities.bg.vx, y: clip.truthVelocities.bg.vy },
+  });
+  if (!allFinite([r.estimate, ...r.layerEstimates, ...r.uncertainty, ...r.reblur.map((b) => b.residual)])) {
+    throw new Error('non-finite value in data-driven inversion');
+  }
+});
+
+test('strategy comparison scores both parameterisations on the same forward residual', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0, quantize: false, boundaryMode: 'frozen' });
+  const cmp = compareLayeredStrategies(clip.obs, oracleSpec(clip, { maxIter: 40 }));
+  if (!['independent', 'shared-bg'].includes(cmp.selected)) throw new Error(`bad selection ${cmp.selected}`);
+  if (!(cmp.scores.independent > 0 && cmp.scores['shared-bg'] > 0)) throw new Error('scores must be positive finite numbers');
+  approx(cmp.scores.independent, layeredResidualRmse(cmp.results.independent, clip.obs), 1e-12, 'independent score consistency');
+  // On the genuinely two-motion frozen clip the joint independent fit wins.
+  if (cmp.selected !== 'independent') throw new Error(`expected independent, got ${cmp.selected}`);
+});
+
+test('layered outputs are finite: estimates, masks, kernels, uncertainty and residuals', () => {
+  const clip = makeLayeredClip({ seed: 21, frames: 5, refIndex: 2, rho: 0.8, noiseSigma: 0.003, quantize: true, boundaryMode: 'exact' });
+  const r = invertLayered(clip.obs, oracleSpec(clip, { maxIter: 30 }));
+  if (!allFinite([r.estimate, ...r.layerEstimates, ...r.layerMasks, ...r.uncertainty, ...r.coverage, ...r.reblur.map((b) => b.predicted), ...r.reblur.map((b) => b.residual), ...r.kernels.map((k) => k.data)])) {
+    throw new Error('NaN/Inf escaped the layered solver');
   }
 });
 

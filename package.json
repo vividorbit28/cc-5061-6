@@ -8,6 +8,7 @@
     "start": "node server/server.js",
     "build": "node server/artifacts.js",
     "test": "node scripts/test.js",
+    "layers": "node scripts/layered-cli.mjs",
     "smoke": "node scripts/ui-smoke.mjs"
   },
   "dependencies": {

@@ -16,6 +16,7 @@ const state = {
   result: null,
   truth: null,
   build: { running: false },
+  layered: null,       // latest layered inversion result
 };
 
 const fmt = (v, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : '–');
@@ -39,6 +40,7 @@ async function init() {
   wireForm();
   wireTabs();
   wireResultControls();
+  wireLayered();
   await selectClip(cat.clips[0].id);
 }
 
@@ -85,14 +87,21 @@ async function selectClip(id) {
   state.frame = state.clip.refIndex;
   state.truth = null;
   state.result = null;
+  state.layered = null;
   clearResult();
   const spec = state.clip.spec;
   $('#metaClip').textContent = state.clip.title;
   $('#metaRho').textContent = fmt(spec.rho, 2);
-  $('#metaExposure').textContent = spec.exposureKind;
+  $('#metaExposure').textContent = spec.exposureKind ?? 'uniform';
   $('#metaNoise').textContent = fmt(spec.noiseSigma, 3);
   $('#frameSlider').max = String(state.clip.frames.length - 1);
   $('#frameSlider').value = String(state.frame);
+  // Blur-segment inputs default to the whole clip.
+  $('#segStart').max = String(state.clip.frames.length - 1);
+  $('#segEnd').max = String(state.clip.frames.length - 1);
+  $('#segStart').value = '0';
+  $('#segEnd').value = String(state.clip.frames.length - 1);
+  configureLayeredPanel();
   // Reference frame options
   const refSel = $('#refIndex');
   refSel.innerHTML = state.clip.frames.map((f, i) =>
@@ -104,6 +113,41 @@ async function selectClip(id) {
   renderPlayerFrame();
   renderThumbnails();
   $('#resultHint').textContent = 'run an inversion to populate';
+}
+
+function isLayeredClip() {
+  return !!(state.clip && state.clip.layered);
+}
+
+// Layered clips expose the layered panel and seed its background velocity from
+// the blind (background-dominated) registration. Single-motion clips hide it;
+// the global model stays available everywhere as the one-layer special config.
+function configureLayeredPanel() {
+  const layered = isLayeredClip();
+  $('#layeredPanel').classList.toggle('hidden', !layered);
+  $('#segmentBlock').classList.toggle('hidden', !layered);
+  $('.tab[data-tab="layers"]').classList.add('hidden');
+  if (!layered) return;
+  const maxLayers = state.catalog.maxLayers ?? 3;
+  $('#maxLayersLbl').textContent = String(maxLayers);
+  $('#layerCount').querySelector(`option[value="${Math.min(3, maxLayers)}"]`)?.setAttribute('selected', '');
+  const c = state.clip.registration.candidate;
+  $('#bgVx').value = String(Math.round(c.vx * 10) / 10);
+  $('#bgVy').value = String(Math.round(c.vy * 10) / 10);
+  // Foreground seed starts negated background (common opposed-motion case); the
+  // user can override. It is only a starting guess for the residual scan.
+  $('#fgVx').value = String(Math.round(-c.vx * 10) / 10);
+  $('#fgVy').value = String(Math.round(-c.vy * 10) / 10);
+  syncLayerSliders();
+}
+
+function syncLayerSliders() {
+  const pairs = [['layerMaxIter', 'layerMaxIterOut', 0], ['layerLambda', 'layerLambdaOut', 3]];
+  for (const [id, out, d] of pairs) {
+    const el = document.getElementById(id);
+    const o = document.getElementById(out);
+    if (el && o) o.textContent = Number(el.value).toFixed(d);
+  }
 }
 
 function applyRegistrationDefaults() {
@@ -690,4 +734,178 @@ async function runBuild() {
     btn.disabled = false;
     btn.textContent = 'Build deliverable videos';
   }
+}
+
+// ---------------------------------------------------------------------------
+// Layered motion inversion (real src/layers.js job; nothing is hard-coded)
+// ---------------------------------------------------------------------------
+
+function wireLayered() {
+  $('#layerMaxIter').addEventListener('input', syncLayerSliders);
+  $('#layerLambda').addEventListener('input', syncLayerSliders);
+  $('#btnLayerFromReg').addEventListener('click', () => {
+    const c = state.clip.registration.candidate;
+    $('#bgVx').value = String(Math.round(c.vx * 10) / 10);
+    $('#bgVy').value = String(Math.round(c.vy * 10) / 10);
+  });
+  $('#btnSegPlayer').addEventListener('click', () => {
+    $('#segStart').value = '0';
+    $('#segEnd').value = String(state.clip.frames.length - 1);
+  });
+  $('#btnLayerInvert').addEventListener('click', runLayeredInversion);
+}
+
+function currentLayeredRequest() {
+  const total = state.clip.frames.length;
+  const frameStart = Math.max(0, Math.min(total - 1, Number($('#segStart').value) || 0));
+  const frameEnd = Math.max(frameStart, Math.min(total - 1, Number($('#segEnd').value) || total - 1));
+  $('#segStart').value = String(frameStart);
+  $('#segEnd').value = String(frameEnd);
+  const layerCount = Number($('#layerCount').value);
+  const seeds = [
+    { vx: Number($('#bgVx').value) || 0, vy: Number($('#bgVy').value) || 0 },
+    { vx: Number($('#fgVx').value) || 0, vy: Number($('#fgVy').value) || 0 },
+    { vx: 0, vy: 0 },
+  ].slice(0, layerCount);
+  return {
+    clipId: state.clipId,
+    mode: 'layered',
+    frameStart,
+    frameEnd,
+    layerCount,
+    layerSeeds: seeds,
+    bgVx: seeds[0].vx, bgVy: seeds[0].vy,
+    fgVx: seeds[1] ? seeds[1].vx : 0, fgVy: seeds[1] ? seeds[1].vy : 0,
+    rho: Number($('#rho').value),
+    exposureKind: $('#exposureKind').value,
+    lambda: Number($('#layerLambda').value),
+    maxIter: Number($('#layerMaxIter').value),
+    alternations: Number($('#layerAlternations').value),
+    estimateMasks: $('#estimateMasks').checked,
+    compareStrategies: $('#compareStrategies').checked,
+  };
+}
+
+function setLayerStatus(cls, stage, detail) {
+  const box = $('#layerJobStatus');
+  box.className = `job-status ${cls}`;
+  box.classList.remove('hidden');
+  $('#layerJobStage').textContent = stage;
+  $('#layerJobDetail').textContent = detail || '';
+  const bar = $('#layerJobBar');
+  if (cls === 'running') bar.style.width = '40%';
+  else if (cls === 'done') bar.style.width = '100%';
+  else if (cls === 'failed') bar.style.width = '100%';
+  else bar.style.width = '0%';
+}
+
+async function runLayeredInversion() {
+  if (!isLayeredClip()) return;
+  const btn = $('#btnLayerInvert');
+  btn.disabled = true;
+  setLayerStatus('running', 'submitting', '');
+  const started = performance.now();
+  try {
+    const r = await fetch('/api/invert', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(currentLayeredRequest()),
+    });
+    if (!r.ok) throw new Error(`layered invert → ${r.status}`);
+    const { jobId } = await r.json();
+    const result = await pollLayeredJob(jobId);
+    const ms = Math.round(performance.now() - started);
+    state.layered = result;
+    renderLayered(result, ms);
+    setLayerStatus('done', 'done', `${ms} ms · ${result.iterations} CG iters`);
+    $('.tab[data-tab="layers"]').classList.remove('hidden');
+    $$('.tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'layers'));
+    $$('.tab-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === 'layers'));
+  } catch (e) {
+    setLayerStatus('failed', 'failed', String(e.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function pollLayeredJob(jobId) {
+  for (;;) {
+    await sleep(350);
+    const j = await getJSON(`/api/job?id=${encodeURIComponent(jobId)}`);
+    setLayerStatus(j.state, j.stage || j.state, j.progress != null ? `${Math.round(j.progress * 100)}%` : '');
+    if (j.state === 'failed') throw new Error(j.error || 'layered job failed');
+    if (j.state === 'done') return j.result;
+  }
+}
+
+function renderLayered(r, ms) {
+  $('#emptyResult').classList.add('hidden');
+  $('#resultWrap').classList.remove('hidden');
+  $('#resultHint').textContent = `layered · ${r.layerCount} layers · ${ms} ms · forward RMSE ${fmt(r.forwardRmse, 4)}`;
+
+  const improvementPct = r.residualImprovement * 100;
+  const cls = improvementPct > 5 ? 'good' : improvementPct < -5 ? 'bad' : '';
+  const items = [
+    { v: fmt(r.forwardRmse, 4), l: 'layered forward RMSE', cls: 'good' },
+    { v: fmt(r.singleMotionRmse, 4), l: 'single-motion RMSE', cls: '' },
+    { v: `${improvementPct >= 0 ? '+' : ''}${fmt(improvePct, 1)}%`, l: 'residual change vs single', cls },
+    { v: String(r.layerCount), l: `motion layers (cap ${r.maxLayers})`, cls: '' },
+  ];
+  $('#layerSummary').innerHTML = items.map((m) =>
+    `<div class="metric ${m.cls}" role="listitem"><div class="v">${m.v}</div><div class="l">${m.l}</div></div>`).join('');
+
+  if (r.strategyChoice) {
+    const sc = r.strategyChoice;
+    $('#layerStrategyNote').innerHTML =
+      `Strategy selected by forward residual: <b>${escapeHTML(sc.selected)}</b> ` +
+      `(independent ${fmt(sc.scores.independent, 4)} vs shared-bg ${fmt(sc.scores['shared-bg'], 4)}, margin ${fmt(sc.margin * 100, 1)}%). ` +
+      `<span class="hint">Both parameterisations are scored on the same re-blur residual; the lower-RMSE one is chosen.</span>`;
+  } else {
+    $('#layerStrategyNote').textContent =
+      `Independent per-layer exposure kernels solved jointly (${r.estimateMasks ? 'data-driven coverage masks' : 'explicit masks'}).`;
+  }
+
+  $('#imgLayerObs').src = r.images.refObs;
+  $('#imgLayerEst').src = r.images.estimate;
+  $('#imgLayerPred').src = r.images.predictedRef;
+  $('#imgLayerRes').src = r.images.residualCombined;
+  $('#imgLayeredEst').src = r.images.estimate;
+  $('#imgSingleEst').src = r.images.singleEstimate;
+  $('#layerCompareNote').innerHTML =
+    `The global single-motion model is the one-layer special configuration of the same forward machinery. On differently-moving fg/bg it must explain both trajectories with one kernel, leaving structured residual (RMSE ${fmt(r.singleMotionRmse, 4)} vs layered ${fmt(r.forwardRmse, 4)}). ` +
+    `<span class="hint">Segment frames ${r.frameStart}–${r.frameEnd}, local reference index ${r.refIndex}. Every image is produced by the solver and the residual is a genuine closed-loop re-blur.</span>`;
+
+  const fig = (img, caption) => `<figure><img src="${img}" alt="${escapeHTML(caption)}" /><figcaption>${caption}</figcaption></figure>`;
+  $('#layerCards').innerHTML = r.images.layerEstimates.map((estImg, l) => {
+    const vel = r.layerVelocities[l] || { vx: 0, vy: 0 };
+    const k = r.kernels[l];
+    const kernelImg = k ? kernelToDataURL(k) : '';
+    return `<div class="layer-card">
+      <h4>layer ${l}${l === 0 ? ' · background' : ' · foreground'}${vel.fixedCoverage ? ' · pinned coverage' : ''}</h4>
+      ${fig(estImg, 'recovered layer image')}
+      ${fig(r.images.layerMasks[l], 'coverage / lock region')}
+      ${fig(r.images.uncertainty[l], 'uncertainty (bright = weakly identified)')}
+      ${kernelImg ? `<img class="kernel-thumb" src="${kernelImg}" alt="kernel ${l}" /><figcaption>exposure kernel ${k.size}×${k.size}</figcaption>` : ''}
+      <div class="kv"><span>velocity</span><b>(${fmt(vel.vx, 2)}, ${fmt(vel.vy, 2)})</b></div>
+    </div>`;
+  }).join('');
+}
+
+// Render a kernel heatmap (same convention as server/render.js) to a data URL.
+function kernelToDataURL(kernel) {
+  const { data, size } = kernel;
+  const scale = Math.max(1, Math.floor(180 / size));
+  const cv = document.createElement('canvas');
+  cv.width = size * scale; cv.height = size * scale;
+  const ctx = cv.getContext('2d');
+  let max = 0;
+  for (const v of data) max = Math.max(max, v);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const t = max > 0 ? Math.pow(data[y * size + x] / max, 0.65) : 0;
+    const rr = Math.round(255 * Math.min(1, t * 1.4));
+    const gg = Math.round(255 * Math.min(1, t * 1.05));
+    const bb = Math.round(255 * Math.min(1, 0.3 + t * 0.7));
+    ctx.fillStyle = `rgb(${rr},${gg},${bb})`;
+    ctx.fillRect(x * scale, y * scale, scale, scale);
+  }
+  return cv.toDataURL('image/png');
 }

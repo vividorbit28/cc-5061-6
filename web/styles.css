@@ -229,3 +229,29 @@ table.metrics td.num { font-family: var(--mono); }
   font: 11px var(--mono); color: var(--muted); backdrop-filter: blur(6px); z-index: 30;
 }
 .statusbar .spacer { flex: 1; }
+
+/* Layered motion inversion */
+.segment-block, .layered-panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 10px 12px;
+  margin-top: 12px;
+}
+.segment-block h3, .layered-panel h3 { margin: 0 0 8px; font-size: 13px; }
+.segment-block .field-row, .layered-panel .field-row { margin-bottom: 8px; }
+.layered-panel .actions { margin-top: 10px; }
+.layer-h { margin: 16px 0 8px; font-size: 13px; color: var(--text); }
+.layer-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.layer-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 8px;
+}
+.layer-card h4 { margin: 0 0 6px; font-size: 12px; color: var(--accent); font-family: var(--mono); }
+.layer-card figure { margin: 0 0 6px; }
+.layer-card img { width: 100%; border-radius: 6px; display: block; background: #000; }
+.layer-card figcaption { font-size: 10px; color: var(--dim); margin-top: 3px; }
+.layer-card .kv { font: 10px var(--mono); color: var(--muted); display: flex; justify-content: space-between; }
+.kernel-thumb { width: 100%; image-rendering: pixelated; border-radius: 6px; }
